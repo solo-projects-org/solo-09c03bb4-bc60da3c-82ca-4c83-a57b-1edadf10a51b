@@ -223,3 +223,134 @@ def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     finally:
         server_a.stop()
         server_b.stop()
+
+
+def _corrupt_published_results(db_path: Path, batch_id: int, seqs: list[int]) -> int:
+    """Delete result rows directly, as a bad backup restore might."""
+
+    from app import db
+
+    with db.connection(str(db_path)) as conn:
+        with db.write_tx(conn):
+            run_id = int(
+                conn.execute(
+                    "SELECT published_run_id FROM batches WHERE id = ?", (batch_id,)
+                ).fetchone()["published_run_id"]
+            )
+            conn.executemany(
+                "DELETE FROM results WHERE run_id = ? AND hotspot_seq = ?",
+                [(run_id, seq) for seq in seqs],
+            )
+    return run_id
+
+
+@pytest.mark.slow
+def test_verification_blocks_bad_result_and_recovers_after_rebuild(tmp_path):
+    """Two real instances share block state and the rebuild queue end to end."""
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            upload_hotspots(client_b, (SAMPLES / "hotspots.csv").read_bytes())
+            wait_published(client_a, 1)
+
+            # A healthy detail verifies cleanly on either instance; downloads
+            # keep working normally.
+            response = client_a.post(f"{client_a.base_url}/batches/1/verify", follow_redirects=False)
+            assert response.status_code == 303
+            assert client_a.get(f"{client_a.base_url}/api/batches/1").json()["blocked"] is False
+            assert client_b.get(f"{client_b.base_url}/batches/1/download.csv").status_code == 200
+
+            # Corrupt the restored data: two source rows lose their results.
+            bad_run = _corrupt_published_results(db_path, 1, [0, 1])
+            response = client_b.post(f"{client_b.base_url}/batches/1/verify", follow_redirects=False)
+            assert response.status_code == 303
+
+            # The block is visible on BOTH instances and downloads are refused.
+            for client in (client_a, client_b):
+                payload = client.get(f"{client.base_url}/api/batches/1").json()
+                assert payload["blocked"] is True
+                assert payload["verifications"][0]["status"] == "failed"
+                assert payload["verifications"][0]["run_id"] == bad_run
+                blocked = client.get(f"{client.base_url}/batches/1/download.csv")
+                assert blocked.status_code == 409
+
+            # The verification enqueued a rebuild; one of the two workers picks
+            # it up and publishes, but the block survives until re-verified.
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                payload = client_a.get(f"{client_a.base_url}/api/batches/1").json()
+                if payload["published_run_id"] != bad_run and not payload["pending"]:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("rebuild never published")
+            assert payload["blocked"] is True
+            assert client_a.get(f"{client_a.base_url}/batches/1/download.csv").status_code == 409
+
+            # Re-verification of the new result passes on instance A and
+            # restores downloads on instance B as well.
+            response = client_a.post(f"{client_a.base_url}/batches/1/verify", follow_redirects=False)
+            assert response.status_code == 303
+            payload_a = client_a.get(f"{client_a.base_url}/api/batches/1").json()
+            payload_b = client_b.get(f"{client_b.base_url}/api/batches/1").json()
+            assert payload_a["blocked"] is False and payload_b["blocked"] is False
+            csv_text = client_b.get(f"{client_b.base_url}/batches/1/download.csv").content.decode(
+                "utf-8-sig"
+            )
+            assert csv_text.count("H-00") == 15
+    finally:
+        server_a.stop()
+        server_b.stop()
+
+
+@pytest.mark.slow
+def test_verify_all_on_two_instances_shares_block_state(tmp_path):
+    """verify-all triggered on one instance blocks downloads seen on the other."""
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            upload_hotspots(client_b, (SAMPLES / "hotspots.csv").read_bytes())
+            wait_published(client_a, 1)
+            bad_run = _corrupt_published_results(db_path, 1, [3])
+
+            response = client_a.post(f"{client_a.base_url}/verify-all", follow_redirects=False)
+            assert response.status_code == 303
+
+            payload = client_b.get(f"{client_b.base_url}/api/batches/1").json()
+            assert payload["blocked"] is True
+            assert payload["verifications"][0]["run_id"] == bad_run
+            assert client_b.get(f"{client_b.base_url}/batches/1/download.csv").status_code == 409
+
+            # Rebuild and recover; then a healthy verify-all reports nothing bad.
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                payload = client_a.get(f"{client_a.base_url}/api/batches/1").json()
+                if payload["published_run_id"] != bad_run and not payload["pending"]:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("rebuild never published")
+            client_b.post(f"{client_b.base_url}/verify-all", follow_redirects=False)
+            assert client_a.get(f"{client_a.base_url}/api/batches/1").json()["blocked"] is False
+            assert client_a.get(f"{client_a.base_url}/batches/1/download.csv").status_code == 200
+    finally:
+        server_a.stop()
+        server_b.stop()

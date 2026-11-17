@@ -8,15 +8,28 @@
       <p class="hint">{{ batch.row_count }} 条来源热点 · 上传于 {{ batch.created_at }}</p>
     </div>
     <div class="actions">
-      <form method="post" action="/batches/{{ batch.id }}/recompute" class="inline">
-        <button type="submit" {% if not active_map %}{% endif %}>按当前底图重算</button>
+      <form method="post" action="/batches/{{ batch.id }}/verify" class="inline">
+        <button type="submit" {% if not published %}disabled{% endif %}>核验已发布结果</button>
       </form>
-      {% if published %}
+      <form method="post" action="/batches/{{ batch.id }}/recompute" class="inline">
+        <button type="submit" class="secondary">按当前底图重算</button>
+      </form>
+      {% if published and not block %}
         <a class="button secondary" href="/batches/{{ batch.id }}/download.csv">下载明细 CSV</a>
+      {% elif published and block %}
+        <span class="pill pill-err" title="核验不合格，已封禁下载">下载已封禁</span>
       {% endif %}
       <a class="button secondary" href="/">返回</a>
     </div>
   </div>
+
+  {% if block %}
+    <div class="flash flash-err">
+      <strong>供数已封禁：</strong>受检计算号 <strong>run #{{ block.run_id }}</strong>
+      核验不合格（{{ block.reason }}），自 {{ block.created_at }} 起禁止新下载。
+      系统已按当前底图排队重建；<strong>重建失败仍保持封禁</strong>，只有新结果核验合格才恢复供数。
+    </div>
+  {% endif %}
 
   {% if pending %}
     <p class="note">计算进行中，本页显示的是上一份已发布结果；刷新查看最新状态。</p>
@@ -30,7 +43,7 @@
       <div class="stat stat-mut"><span class="num">{{ published.unmatched_count }}</span><span class="lbl">未匹配</span></div>
     </div>
     <p class="hint">
-      下载内容基于 <strong>计算 run #{{ published.id }}</strong>，
+      下载内容基于 <strong>计算 run #{{ published.id }}</strong>（受检计算号同此），
       林班底图 <strong>v{{ published.map_version_id }} · {{ published.map_filename }}</strong>
       （sha256 <span class="mono">{{ published.map_sha256[:16] }}…</span>），
       发布于 {{ published.finished_at }}。
@@ -104,6 +117,48 @@
   </div>
 </section>
 {% endif %}
+
+<section class="card">
+  <h2>核验记录（备份恢复后供数核验）</h2>
+  {% if not verifications %}
+    <p class="empty">尚未核验。恢复数据库备份后，请点"核验已发布结果"：系统逐来源行检查是否恰好一条结果，并核对状态汇总与发布统计。</p>
+  {% else %}
+  <table class="compact">
+    <thead>
+      <tr><th>#</th><th>受检计算号</th><th>底图</th><th>结论</th><th>问题数</th><th>异常行/问题</th><th>时间 (UTC)</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+    {% for v in verifications %}
+      <tr class="{{ 'row-ok' if v.status == 'passed' else 'row-warn' }}">
+        <td>{{ v.id }}</td>
+        <td class="mono">run #{{ v.run_id }}</td>
+        <td>{% if v.map_version_id %}v{{ v.map_version_id }}{% else %}—{% endif %}</td>
+        <td>
+          {% if v.status == 'passed' %}<span class="pill pill-ok">合格</span>
+          {% else %}<span class="pill pill-err">不合格</span>{% endif %}
+          {% if not v.applied %}<span class="pill pill-mut" title="核验期间结果已被替换，本次未应用">未应用</span>{% endif %}
+        </td>
+        <td>{{ v.issue_count }}</td>
+        <td class="reason">
+          {% if v.issues %}
+            {% for issue in v.issues[:5] %}
+              <div>· {{ issue.label }}{% if issue.seqs %}：seq {{ issue.seqs[:8]|join(', ') }}{% if issue.seqs|length > 8 %}…{% endif %}{% endif %}</div>
+            {% endfor %}
+            {% if v.issues|length > 5 %}<div class="muted">其余 {{ v.issues|length - 5 }} 类见接口 /api/batches/{{ batch.id }}</div>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td class="mono">{{ v.checked_at }}</td>
+        <td class="reason">{{ v.note or '' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">
+    核验不合格会封禁该批次后续下载，并在同一事务内按当前底图排队重建；重建失败仍禁供，只有新结果核验合格才恢复。
+    核验期间结果被其他实例替换时，本次核验标记为"未应用"，不会封禁新结果。
+  </p>
+  {% endif %}
+</section>
 
 <section class="card">
   <h2>计算记录</h2>

@@ -91,6 +91,41 @@ CREATE TABLE IF NOT EXISTS results (
     codes_json      TEXT NOT NULL,
     PRIMARY KEY (run_id, hotspot_seq)
 );
+
+-- Post-restore verification of a published detail.  One row per verification
+-- attempt; ``applied`` is 0 when the result was replaced between the read and
+-- the commit, so the stale attempt must not change any block state.
+CREATE TABLE IF NOT EXISTS verifications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    run_id          INTEGER NOT NULL,
+    map_version_id  INTEGER,
+    status          TEXT NOT NULL,           -- passed|failed
+    applied         INTEGER NOT NULL DEFAULT 1,
+    issue_count     INTEGER NOT NULL DEFAULT 0,
+    issues_json     TEXT NOT NULL DEFAULT '[]',
+    note            TEXT,
+    checked_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_verifications_batch ON verifications (batch_id, id);
+
+-- A batch is forbidden from new downloads while it has an active (unrecovered)
+-- block.  The partial unique index guarantees at most one active block per
+-- batch; recovery happens only when a verification of the currently published
+-- replacement run passes.
+CREATE TABLE IF NOT EXISTS supply_blocks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    run_id          INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    recovered_at    TEXT,
+    recovered_verification_id INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_supply_blocks_active
+    ON supply_blocks (batch_id) WHERE recovered_at IS NULL;
 """
 
 

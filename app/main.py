@@ -134,6 +134,68 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             return _redirect("/", msg=note, err="；".join(errors))
         return _redirect("/", msg=note)
 
+    @app.post("/verify-all")
+    def verify_all(request: Request):
+        """Post-restore check of every published detail, across both instances."""
+
+        with conn() as c:
+            targets = [
+                int(row["id"])
+                for row in c.execute(
+                    "SELECT id FROM batches WHERE published_run_id IS NOT NULL ORDER BY id"
+                ).fetchall()
+            ]
+        if not targets:
+            return _redirect("/", err="当前没有已发布的结果可供核验")
+        summaries = []
+        for batch_id in targets:
+            try:
+                summaries.append(service.verify_published_batch(app.state.settings["db_path"], batch_id))
+            except service.ServiceError as exc:
+                return _redirect("/", err=str(exc))
+        kick_worker()
+        failed = [item for item in summaries if item.get("applied") and item["status"] == service.VERIFY_FAILED]
+        blocked = sum(1 for item in failed if item["blocked"])
+        recovered = sum(1 for item in summaries if item.get("recovered"))
+        note = f"已核验 {len(summaries)} 个批次，受检计算号：" + "、".join(
+            f"#{item['run_id']}" for item in summaries
+        )
+        err = None
+        if failed:
+            err = f"{blocked} 个批次发现缺行/额外行/统计不符，已封禁下载并按当前底图排队重建"
+        if recovered:
+            note += f"；{recovered} 个批次重新核验合格，已恢复供数"
+        return _redirect("/", msg=note, err=err)
+
+    @app.post("/batches/{batch_id}/verify")
+    def verify_batch(request: Request, batch_id: int):
+        try:
+            summary = service.verify_published_batch(app.state.settings["db_path"], batch_id)
+        except service.ServiceError as exc:
+            return _redirect(f"/batches/{batch_id}", err=str(exc))
+        kick_worker()
+        if not summary["applied"]:
+            return _redirect(
+                f"/batches/{batch_id}",
+                err="核验期间该批次已被其他实例重新发布，本次核验结果未应用（不影响新结果）",
+            )
+        run_no = summary["run_id"]
+        if summary["status"] == service.VERIFY_PASSED:
+            if summary["recovered"]:
+                msg = f"受检计算号 #{run_no} 核验合格，已恢复下载供数"
+            else:
+                msg = f"受检计算号 #{run_no} 核验合格：每来源行恰好一条，状态汇总与发布统计一致"
+            return _redirect(f"/batches/{batch_id}", msg=msg)
+        kinds = "、".join(issue["label"] for issue in summary["issues"][:4])
+        err = (
+            f"受检计算号 #{run_no} 核验不合格：{kinds}；已封禁该结果后续下载"
+        )
+        if summary["requeued_run_id"] is not None:
+            err += f"，并按当前底图排队重建（run #{summary['requeued_run_id']}）"
+        else:
+            err += "，但当前无活动底图，未能排队重建"
+        return _redirect(f"/batches/{batch_id}", err=err)
+
     @app.post("/batches")
     def upload_batch(request: Request, file: UploadFile = File(...)):
         try:
@@ -174,6 +236,8 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             active_map = service.get_active_map(c)
             published = service.get_published_run(c, batch)
             runs = service.list_runs(c, batch_id)
+            block = service.get_active_block(c, batch_id)
+            verifications = service.list_verifications(c, batch_id)
             counts = service.result_counts(c, published["id"]) if published else []
             preview = (
                 service.preview_results(
@@ -194,6 +258,8 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "active_map": active_map,
                 "published": published,
                 "runs": runs,
+                "block": block,
+                "verifications": verifications,
                 "counts": counts,
                 "preview": preview,
                 "only_problems": only == "problems",
@@ -210,7 +276,16 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             batch = service.get_batch(c, batch_id)
             if batch is None:
                 raise HTTPException(status_code=404, detail="热点批次不存在")
+            block = service.get_active_block(c, batch_id)
             published = service.get_published_run(c, batch)
+        if block is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"批次 #{batch_id} 的已发布结果 run #{block['run_id']} 核验不合格，"
+                    "下载已封禁；按当前底图重建并重新核验合格后自动恢复"
+                ),
+            )
         if published is None:
             raise HTTPException(status_code=409, detail="该批次还没有可下载的计算结果")
         name = f"hotspot_attribution_batch{batch_id}_run{published['id']}.csv"
@@ -234,6 +309,8 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 raise HTTPException(status_code=404, detail="热点批次不存在")
             published = service.get_published_run(c, batch)
             runs = service.list_runs(c, batch_id, limit=10)
+            block = service.get_active_block(c, batch_id)
+            verifications = service.list_verifications(c, batch_id, limit=5)
         return {
             "batch_id": batch_id,
             "published_run_id": batch["published_run_id"],
@@ -242,6 +319,22 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             "matched": published["matched_count"] if published else None,
             "conflict": published["conflict_count"] if published else None,
             "unmatched": published["unmatched_count"] if published else None,
+            "blocked": block is not None,
+            "block": block,
+            "verifications": [
+                {
+                    "id": item["id"],
+                    "run_id": item["run_id"],
+                    "map_version_id": item["map_version_id"],
+                    "status": item["status"],
+                    "applied": bool(item["applied"]),
+                    "issue_count": item["issue_count"],
+                    "issues": item["issues"],
+                    "note": item["note"],
+                    "checked_at": item["checked_at"],
+                }
+                for item in verifications
+            ],
             "pending": any(
                 run["status"] in (service.STATUS_QUEUED, service.STATUS_RUNNING) for run in runs
             ),

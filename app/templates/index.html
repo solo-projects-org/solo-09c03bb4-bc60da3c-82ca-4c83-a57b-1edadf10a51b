@@ -43,7 +43,13 @@
         当前底图重算全部批次
       </button>
     </form>
-    <p class="hint">更换底图后，点此按新版本重算同一批热点；旧结果会保留到新结果成功发布为止。</p>
+    <form method="post" action="/verify-all" class="inline">
+      <button type="submit" class="secondary" {% if not batches %}disabled{% endif %}>
+        核验全部已发布结果
+      </button>
+    </form>
+    <p class="hint">更换底图后，点此按新版本重算同一批热点；旧结果会保留到新结果成功发布为止。
+      恢复数据库备份后，请用"核验全部已发布结果"逐来源行核对明细：缺行、额外行或统计不符的结果会被封禁下载并自动排队重建。</p>
   </div>
 </section>
 
@@ -56,12 +62,12 @@
     <thead>
       <tr>
         <th>批次</th><th>文件</th><th>热点数</th><th>已发布结果</th>
-        <th>已赋码</th><th>冲突</th><th>未匹配</th><th>底图</th><th>操作</th>
+        <th>已赋码</th><th>冲突</th><th>未匹配</th><th>底图</th><th>供数状态</th><th>操作</th>
       </tr>
     </thead>
     <tbody>
     {% for b in batches %}
-      <tr>
+      <tr class="{{ 'row-warn' if b.blocked else '' }}">
         <td>#{{ b.id }}</td>
         <td class="mono">{{ b.filename }}</td>
         <td>{{ b.row_count }}</td>
@@ -79,10 +85,21 @@
         <td>{{ b.pub_conflict if b.pub_conflict is not none else '—' }}</td>
         <td>{{ b.pub_unmatched if b.pub_unmatched is not none else '—' }}</td>
         <td>{% if b.pub_map_id %}v{{ b.pub_map_id }}{% else %}—{% endif %}</td>
+        <td>
+          {% if b.blocked %}
+            <span class="pill pill-err">已封禁·重建中</span>
+          {% elif b.pub_run_id %}
+            <span class="pill pill-ok">可供数</span>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
         <td class="actions">
           <a class="button" href="/batches/{{ b.id }}">查看</a>
-          {% if b.pub_run_id %}
+          {% if b.pub_run_id and not b.blocked %}
             <a class="button secondary" href="/batches/{{ b.id }}/download.csv">下载 CSV</a>
+          {% elif b.pub_run_id and b.blocked %}
+            <span class="pill pill-err" title="核验不合格，下载已封禁">下载已封禁</span>
           {% endif %}
         </td>
       </tr>
